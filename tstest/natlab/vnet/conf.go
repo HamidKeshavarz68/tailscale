@@ -348,11 +348,12 @@ type Network struct {
 
 	wanIP6 netip.Prefix // global unicast router in host bits; CIDR is /64 delegated to LAN
 
-	wanIP4                      netip.Addr // IPv4 WAN IP, if any
-	lanIP4                      netip.Prefix
-	nodes                       []*Node
-	breakWAN4                   bool // whether to break WAN IPv4 connectivity
-	network                     *network
+	wanIP4    netip.Addr // IPv4 WAN IP, if any
+	lanIP4    netip.Prefix
+	nodes     []*Node
+	breakWAN4 bool         // whether to break WAN IPv4 connectivity
+	dhcpDNS   []netip.Addr // DNS servers the DHCP server advertises; nil means fakeDNS
+	network   *network
 
 	svcs set.Set[NetworkService]
 
@@ -382,6 +383,23 @@ func (n *Network) SetPacketLoss(rate float64) {
 // out to the Internet. (DHCP etc continues to work on the LAN.)
 func (n *Network) SetBlackholedIPv4(v bool) {
 	n.breakWAN4 = v
+}
+
+// SetDHCPDNS sets the IPv4 DNS servers the network's DHCP server advertises
+// in its offers and acks. The default is [FakeDNSIPv4]. It takes effect
+// immediately, including for a network that is already running; a client
+// sees the change on its next lease renewal.
+func (n *Network) SetDHCPDNS(servers ...netip.Addr) {
+	for _, s := range servers {
+		if !s.Is4() {
+			n.err = fmt.Errorf("SetDHCPDNS: %v is not an IPv4 address", s)
+			return
+		}
+	}
+	n.dhcpDNS = slices.Clone(servers)
+	if n.network != nil {
+		n.network.dhcpDNS.Store(n.dhcpDNS)
+	}
 }
 
 func (n *Network) CanV4() bool {
@@ -468,6 +486,7 @@ func (s *Server) initFromConfig(c *Config) error {
 			nodesByMAC: map[MAC]*node{},
 			logf:       logger.WithPrefix(s.logf, fmt.Sprintf("[net-%v] ", conf.mac)),
 		}
+		n.dhcpDNS.Store(conf.dhcpDNS)
 		netOfConf[conf] = n
 		s.networks.Add(n)
 

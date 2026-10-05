@@ -185,6 +185,151 @@ func TestOpenresolvDNSOtherSnippet(t *testing.T) {
 	assertResolves(t, env, node, orUpstreamOnlyName, orUpstreamOnlyIP)
 }
 
+// orDeadNameserver is a nameserver nothing answers. It is in TEST-NET-2, which
+// vnet routes nowhere: the router drops packets for it silently.
+const orDeadNameserver = "198.51.100.53"
+
+// TestOpenresolvDNSSnippetChange checks that tailscaled picks up a change to
+// another snippet's nameservers when nothing else about the network changes.
+// A DHCP lease renewal that carries new DNS servers looks like this: the
+// client's resolvconf hook re-registers its snippet, and there is no netlink
+// event. See tailscale/tailscale#21607.
+func TestOpenresolvDNSSnippetChange(t *testing.T) {
+	env, node := newOpenresolvEnv(t)
+
+	// The DHCP snippet starts out pointing at a nameserver nothing answers.
+	addOpenresolvSnippet(t, env, node, "eth0.dhcp", orDeadNameserver)
+
+	// Make tailscaled read the snippet and take over resolv.conf.
+	env.SetAcceptDNS(node, false)
+	env.SetAcceptDNS(node, true)
+	assertOpenresolvResolvConf(t, env, node,
+		[]string{orSignature, orQuad100},
+		[]string{orDeadNameserver})
+
+	// The lease renews with a working nameserver.
+	addOpenresolvSnippet(t, env, node, "eth0.dhcp", vnet.FakeDNSIPv4().String())
+
+	// tailscaled can read the new nameserver back.
+	if base := openresolvBaseConfig(t, env, node); base != nil {
+		if want := vnet.FakeDNSIPv4().String(); !slices.Equal(base.Nameservers, []string{want}) {
+			t.Fatalf("OS base config nameservers after renewal = %q, want just %s", base.Nameservers, want)
+		}
+	}
+
+	// Public names must resolve through quad-100 within a reasonable time.
+	assertResolves(t, env, node, orUpstreamOnlyName, orUpstreamOnlyIP)
+}
+
+// TestOpenresolvDNSDHCPHookRace checks that tailscaled picks up the DNS
+// servers a DHCP lease carries when dhcpcd rebinds the lease. dhcpcd
+// configures the interface first and runs its resolvconf hook afterwards, so
+// the nameservers are registered some time after the netlink events. See
+// tailscale/tailscale#21607.
+//
+// The guest runs systemd-networkd, not dhcpcd, so the test performs dhcpcd's
+// steps itself over SSH, in dhcpcd's order.
+func TestOpenresolvDNSDHCPHookRace(t *testing.T) {
+	env, node := newOpenresolvEnv(t)
+
+	// dhcpcd registers one snippet per interface and protocol. The RA
+	// snippet carries a nameserver that nothing answers, and it outlives the
+	// DHCP lease.
+	addOpenresolvSnippet(t, env, node, "eth0.ra", orDeadNameserver)
+	addOpenresolvSnippet(t, env, node, "eth0.dhcp", vnet.FakeDNSIPv4().String())
+
+	// Make tailscaled read both snippets and take over resolv.conf.
+	env.SetAcceptDNS(node, false)
+	env.SetAcceptDNS(node, true)
+	assertOpenresolvResolvConf(t, env, node,
+		[]string{orSignature, orQuad100},
+		[]string{vnet.FakeDNSIPv4().String()})
+
+	// quad-100 forwards to both nameservers, so the dead one does not
+	// prevent resolution.
+	assertResolves(t, env, node, orUpstreamOnlyName, orUpstreamOnlyIP)
+
+	// Count the resolver configs compiled so far. The replay must add one.
+	before := len(resolverCfgLogs(t, env, node))
+	if before == 0 {
+		t.Fatal("no Resolvercfg lines in tailscaled's log")
+	}
+
+	// Replay dhcpcd rebinding a lease that expired. The hook removed
+	// eth0.dhcp at expiry. On rebind, dhcpcd configures the address, then
+	// runs the hook, which adds the snippet back. The sleep stands in for
+	// the time the hook takes to run. The /32 is outside the LAN and changes
+	// nothing about what the guest can reach; it exists only to produce the
+	// netlink event that dhcpcd's own address change would.
+	cmd := fmt.Sprintf(`set -e
+dev=$(ip -4 -o route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
+resolvconf -d eth0.dhcp -f
+ip addr add 10.123.45.67/32 dev "$dev"
+sleep 0.5
+printf 'nameserver %s\n' | resolvconf -a eth0.dhcp
+`, vnet.FakeDNSIPv4())
+	if out, err := env.SSHExec(node, cmd); err != nil {
+		t.Fatalf("replaying dhcpcd: %v (%s)", err, strings.TrimSpace(out))
+	}
+
+	// The lease's nameserver is registered again, and tailscaled can read it.
+	if base := openresolvBaseConfig(t, env, node); base != nil {
+		if want := vnet.FakeDNSIPv4().String(); !slices.Contains(base.Nameservers, want) {
+			t.Fatalf("OS base config nameservers after replay = %q, want %s among them", base.Nameservers, want)
+		}
+	}
+
+	// Some resolver config compiled since the replay must include the
+	// lease's nameserver.
+	var since []string
+	if err := tstest.WaitFor(60*time.Second, func() error {
+		since = resolverCfgLogs(t, env, node)[before:]
+		for _, line := range since {
+			if strings.Contains(line, vnet.FakeDNSIPv4().String()) {
+				return nil
+			}
+		}
+		return fmt.Errorf("no resolver config since the replay includes %s", vnet.FakeDNSIPv4())
+	}); err != nil {
+		t.Errorf("%v (tailscale/tailscale#21607); configs compiled since the replay:\n%s",
+			err, strings.Join(since, "\n"))
+	}
+
+	// Public names must still resolve.
+	assertResolves(t, env, node, orUpstreamOnlyName, orUpstreamOnlyIP)
+}
+
+// addOpenresolvSnippet registers a resolvconf snippet with the given name and
+// single nameserver on the node, the way a DHCP client's hook would.
+func addOpenresolvSnippet(t *testing.T, env *vmtest.Env, n *vmtest.Node, name, nameserver string) {
+	t.Helper()
+	cmd := fmt.Sprintf("printf 'nameserver %s\\n' | resolvconf -a %s", nameserver, name)
+	if out, err := env.SSHExec(n, cmd); err != nil {
+		t.Fatalf("%s: %v (%s)", cmd, err, strings.TrimSpace(out))
+	}
+}
+
+// resolverCfgLogs returns the "dns: Resolvercfg" lines tailscaled has logged
+// so far, oldest first. Each is the resolver configuration tailscaled compiled
+// on one DNS set.
+//
+// It reads cloud-init's output log, where tailscaled's output lands because
+// cloud-init's runcmd started it. Cloud-image guests do not upload to the fake
+// log catcher; only gokrazy guests trust its certificate.
+func resolverCfgLogs(t *testing.T, env *vmtest.Env, n *vmtest.Node) []string {
+	t.Helper()
+	const cmd = "grep -F 'dns: Resolvercfg:' /var/log/cloud-init-output.log || true"
+	out, err := env.SSHExec(n, cmd)
+	if err != nil {
+		t.Fatalf("%s: %v (%s)", cmd, err, strings.TrimSpace(out))
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
 // assertOpenresolvResolvConf waits for the guest's /etc/resolv.conf to contain
 // every string in want and none in notWant.
 func assertOpenresolvResolvConf(t *testing.T, env *vmtest.Env, n *vmtest.Node, want, notWant []string) {

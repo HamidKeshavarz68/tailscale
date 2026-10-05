@@ -673,16 +673,17 @@ type network struct {
 	portmap          bool
 	lanInterfaceID   int
 	wanInterfaceID   int
-	v4               bool                 // network supports IPv4
-	v6               bool                 // network support IPv6
-	wanIP6           netip.Prefix         // router's WAN IPv6, if any, as a /64.
-	wanIP4           netip.Addr           // router's LAN IPv4, if any
-	lanIP4           netip.Prefix         // router's LAN IP + CIDR (e.g. 192.168.2.1/24)
-	breakWAN4        bool                 // break WAN IPv4 connectivity
-	blackholeControl bool                 // blackhole control connectivity
-	latency          time.Duration        // latency applied to interface writes
-	lossRate         float64              // probability of dropping a packet (0.0 to 1.0)
-	nodesByIP4       map[netip.Addr]*node // by LAN IPv4
+	v4               bool                            // network supports IPv4
+	v6               bool                            // network support IPv6
+	wanIP6           netip.Prefix                    // router's WAN IPv6, if any, as a /64.
+	wanIP4           netip.Addr                      // router's LAN IPv4, if any
+	lanIP4           netip.Prefix                    // router's LAN IP + CIDR (e.g. 192.168.2.1/24)
+	breakWAN4        bool                            // break WAN IPv4 connectivity
+	blackholeControl bool                            // blackhole control connectivity
+	dhcpDNS          syncs.AtomicValue[[]netip.Addr] // DNS servers the DHCP server advertises; nil means fakeDNS
+	latency          time.Duration                   // latency applied to interface writes
+	lossRate         float64                         // probability of dropping a packet (0.0 to 1.0)
+	nodesByIP4       map[netip.Addr]*node            // by LAN IPv4
 	nodesByMAC       map[MAC]*node
 	logf             func(format string, args ...any)
 
@@ -2350,11 +2351,7 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 				Data:   gwIP.AsSlice(),
 				Length: 4,
 			},
-			layers.DHCPOption{
-				Type:   layers.DHCPOptDNS,
-				Data:   fakeDNS.v4.AsSlice(),
-				Length: 4,
-			},
+			srcNet.dhcpDNSOption(),
 		)
 		if s.onDHCPEvent != nil {
 			s.onDHCPEvent(srcMAC, node.num, layers.DHCPMsgTypeDiscover, clientIP)
@@ -2377,11 +2374,7 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 				Data:   gwIP.AsSlice(),
 				Length: 4,
 			},
-			layers.DHCPOption{
-				Type:   layers.DHCPOptDNS,
-				Data:   fakeDNS.v4.AsSlice(),
-				Length: 4,
-			},
+			srcNet.dhcpDNSOption(),
 			layers.DHCPOption{
 				Type:   layers.DHCPOptSubnetMask,
 				Data:   net.CIDRMask(srcNet.lanIP4.Bits(), 32),
@@ -2409,6 +2402,24 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 		DstPort: udpLayer.SrcPort,
 	}
 	return mkPacket(eth, ip, udp, response)
+}
+
+// dhcpDNSOption returns the DNS servers option for the network's DHCP offers
+// and acks: the servers set with [Network.SetDHCPDNS], or fakeDNS by default.
+func (n *network) dhcpDNSOption() layers.DHCPOption {
+	servers := n.dhcpDNS.Load()
+	if len(servers) == 0 {
+		servers = []netip.Addr{fakeDNS.v4}
+	}
+	var data []byte
+	for _, s := range servers {
+		data = append(data, s.AsSlice()...)
+	}
+	return layers.DHCPOption{
+		Type:   layers.DHCPOptDNS,
+		Data:   data,
+		Length: uint8(len(data)),
+	}
 }
 
 // isDHCPRequest reports whether pkt is a DHCPv4 request.
